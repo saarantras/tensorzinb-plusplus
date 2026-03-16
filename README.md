@@ -1,3 +1,5 @@
+This is a fork of [the original tensorzinb package](https://github.com/wanglab-georgetown/tensorzinb), updated to be compatible with more recent versions of tensorflow to function on modern hardware.
+
 ## Zero-inflated Negative Binomial Model using TensorFlow
 
 TensorZINB is a Python module that uses TensorFlow to effectively solve negative binomial (NB) and zero-inflated negative binomial (ZINB) models. One of its key strengths is its ability to accurately calculate the NB/ZINB log likelihood. Additionally, it can be used for differentially expressed gene (DEG) analysis in the context of single-cell RNA sequencing (scRNA-seq). This package distinguishes itself by ensuring numerical stability, enabling the processing of datasets in batches, and delivering superior computing speeds compared to other existing NB/ZINB solvers. To guarantee the reliability of its analysis results, TensorZINB has undergone rigorous testing against various statistical packages. TensorZINB supports the execution of various features on both the negative binomial and zero-inflated (logit) components. Furthermore, it allows for the use of common features with the same weights across multiple subjects within a batch.
@@ -24,19 +26,7 @@ where $\mu_g$ is the mean of subject $g$, $X_{\mu}$, $Z_{\mu}$, $X_{\pi}$ and $Z
 
 ## Installation
 
-After downloading this repo, `cd` to the directory of downloaded repo and run:
-
-`python setup.py install`
-
-or 
-
-`pip install .`
-
-For Apple silicon (M1, M2 and etc), it is recommended to install TensorFlow by following the command in Troubleshooting Section below.
-
-## Model Estimation
-
-`TensorZINB` solves the negative binomial (NB) and zero-inflated negative binomial (ZINB) models with given read counts. 
+pip install tensorzinb-plusplus
 
 ### Model initialization
 
