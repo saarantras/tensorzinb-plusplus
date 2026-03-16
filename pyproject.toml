@@ -1,0 +1,54 @@
+[build-system]
+# hatchling is the build backend — the tool that actually creates the wheel
+# and sdist files that get uploaded to PyPI. pip calls it automatically.
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+# Distribution name on PyPI — what users type in `pip install tensorzinb-plusplus`
+name = "tensorzinb-plusplus"
+version = "0.0.2"
+description = "Zero Inflated Negative Binomial regression for scRNA-seq (maintained fork of tensorzinb by Tao Cui & Tingting Wang)"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.9,<3.13"
+authors = [
+  { name = "Tao Cui", email = "taocui.caltech@gmail.com" },
+  { name = "Tingting Wang" },
+]
+maintainers = [
+  { name = "McNoon" },
+]
+keywords = ["zero-inflated negative binomial", "scRNA-seq", "differential expression", "tensorflow"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+  "tensorflow>=2.16",
+  "tf-keras>=2.16",
+  "numpy>=1.23.5",
+  "pandas>=1.5.2",
+  "patsy>=0.5.3",
+  "scikit-learn>=1.2.0",
+  "scipy>=1.9.3",
+  "statsmodels>=0.13.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/mcnoon/tensorzinb-plusplus"
+"Original Repository" = "https://github.com/wanglab-georgetown/tensorzinb"
+
+[tool.hatch.build.targets.wheel]
+# Tells hatchling that the importable package is the `tensorzinb/` directory.
+# This is what ends up inside the wheel — users do `import tensorzinb` after
+# installing the `tensorzinb-plusplus` distribution.
+packages = ["tensorzinb"]
