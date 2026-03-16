@@ -7,12 +7,9 @@ except ImportError:
 with open('README.md') as f:
     readme = f.read()
 
-import sys
-tensorflow = 'tensorflow_macos==2.9.2' if sys.platform == 'darwin' else 'tensorflow==2.9.2'
-
 setup(
     name='tensorzinb',
-    version='0.0.1',
+    version='0.0.2',
     description='Zero Inflated Negative Binomial Model for Single-cell RNA-Sequencing Analysis using TensorFlow',
     long_description=readme,
     long_description_content_type='text/markdown',
@@ -22,15 +19,16 @@ setup(
     keywords='Zero Inflated Negative Binomial scRNA-seq',
     packages=['tensorzinb'],
     include_package_data=True,
+    python_requires='>=3.9,<3.13',
     install_requires=[
-        'keras==2.9.0',
-        'numpy>1.23.5,<2',
+        'tensorflow>=2.16',
+        'tf-keras>=2.16',
+        'numpy>=1.23.5',
         'pandas',
         'patsy',
         'scikit_learn',
         'scipy',
         'statsmodels',
-        tensorflow,
     ],
     license='Apache',
     classifiers=[
@@ -38,12 +36,10 @@ setup(
         'Intended Audience :: Developers',
         'License :: OSI Approved :: Apache Software License',
         'Operating System :: OS Independent',
-        'Programming Language :: Python :: 2.7',
         'Programming Language :: Python :: 3',
-        'Programming Language :: Python :: 3.4',
-        'Programming Language :: Python :: 3.5',
-        'Programming Language :: Python :: 3.6',
-        'Programming Language :: Python :: 3.7',
-        'Programming Language :: Python :: 3.8',
+        'Programming Language :: Python :: 3.9',
+        'Programming Language :: Python :: 3.10',
+        'Programming Language :: Python :: 3.11',
+        'Programming Language :: Python :: 3.12',
     ]
 )

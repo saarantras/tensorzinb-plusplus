@@ -1,52 +1,30 @@
 import warnings
 import time
 
-# import tensorflow as tf
 import contextlib
 import os
 import numpy as np
-from keras.models import Model
-from keras.layers import Lambda, Input, Dense, RepeatVector, Reshape, Add
-from keras.callbacks import EarlyStopping, ReduceLROnPlateau
-from keras.optimizers import RMSprop
-from keras import backend as K
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["TF_USE_LEGACY_KERAS"] = "1"
+
+import tensorflow as tf
+
+tf.get_logger().setLevel("ERROR")
+tf.autograph.set_verbosity(0)
+
+import tf_keras
+from tf_keras.models import Model
+from tf_keras.layers import Lambda, Input, Dense, RepeatVector, Reshape, Add
+from tf_keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tf_keras.optimizers.legacy import RMSprop
+from tf_keras import backend as K
 from scipy.special import gammaln
 import statsmodels.api as sm
 
-
-from tensorflow.python.keras.backend import clear_session
-from tensorflow.python.keras.backend import get_session
-from tensorflow.python.framework.ops import disable_eager_execution
-
-
-def import_tensorflow():
-    # Filter tensorflow version warnings
-    import os
-
-    # https://stackoverflow.com/questions/40426502/is-there-a-way-to-suppress-the-messages-tensorflow-prints/40426709
-    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # or any {'0', '1', '2'}
-    import warnings
-
-    # https://stackoverflow.com/questions/15777951/how-to-suppress-pandas-future-warning
-    warnings.simplefilter(action="ignore", category=FutureWarning)
-    warnings.simplefilter(action="ignore", category=Warning)
-    import tensorflow as tf
-
-    tf.get_logger().setLevel("INFO")
-    tf.autograph.set_verbosity(0)
-    import logging
-
-    tf.get_logger().setLevel(logging.ERROR)
-    return tf
-
-
-tf = import_tensorflow()
-
 # Reset Keras Session
 def reset_keras():
-    sess = get_session()
-    clear_session()
-    sess.close()
+    K.clear_session()
 
 
 class ZINBLogLik:
@@ -95,7 +73,7 @@ class ZINBLogLik:
         return result
 
 
-class PredictionCallback(tf.keras.callbacks.Callback):
+class PredictionCallback(tf_keras.callbacks.Callback):
     def on_train_begin(self, logs={}):
         self.weights = []
 
@@ -277,7 +255,7 @@ class TensorZINB:
                 K.clear_session()
 
         with tf.device(device_name):
-            disable_eager_execution()
+            tf.compat.v1.disable_eager_execution()
 
             inputs = Input(shape=(num_feat,))
             inputs_infl = Input(shape=(num_feat_infl,))
