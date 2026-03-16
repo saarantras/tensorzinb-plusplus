@@ -17,7 +17,7 @@ authors = [
   { name = "Tingting Wang" },
 ]
 maintainers = [
-  { name = "McNoon" },
+  { name = "Mackenzie Noon",email="me@mackenzienoon.com" },
 ]
 keywords = ["zero-inflated negative binomial", "scRNA-seq", "differential expression", "tensorflow"]
 classifiers = [
@@ -44,7 +44,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/mcnoon/tensorzinb-plusplus"
+Homepage = "https://github.com/saarantras/tensorzinb-plusplus"
 "Original Repository" = "https://github.com/wanglab-georgetown/tensorzinb"
 
 [tool.hatch.build.targets.wheel]
