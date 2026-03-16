@@ -41,3 +41,7 @@ Thumbs.db
 *.wmv
 
 *checkpoint.ipynb
+
+# Python packaging
+*.egg-info/
+__pycache__/
