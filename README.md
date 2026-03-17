@@ -1,4 +1,4 @@
-This is a fork of [the original tensorzinb package](https://github.com/wanglab-georgetown/tensorzinb), updated to be compatible with more recent versions of tensorflow to function on modern hardware.
+This is a fork of [the original tensorzinb package](https://github.com/wanglab-georgetown/tensorzinb), updated to be compatible with more recent versions of tensorflow to function on modern hardware & to function with sparse input (useful for extremely zero-inflated data).
 
 ## Zero-inflated Negative Binomial Model using TensorFlow
 
