@@ -15,9 +15,10 @@ requires-python = ">=3.9,<3.13"
 authors = [
   { name = "Tao Cui", email = "taocui.caltech@gmail.com" },
   { name = "Tingting Wang" },
+  { name = "Mackenzie Noon", email = "me@mackenzienoon.com" },
 ]
 maintainers = [
-  { name = "Mackenzie Noon",email="me@mackenzienoon.com" },
+  { name = "Mackenzie Noon", email = "me@mackenzienoon.com" },
 ]
 keywords = ["zero-inflated negative binomial", "scRNA-seq", "differential expression", "tensorflow"]
 classifiers = [
