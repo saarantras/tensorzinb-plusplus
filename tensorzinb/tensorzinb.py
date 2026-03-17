@@ -4,6 +4,7 @@ import time
 import contextlib
 import os
 import numpy as np
+import scipy.sparse
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["TF_USE_LEGACY_KERAS"] = "1"
@@ -25,6 +26,86 @@ import statsmodels.api as sm
 # Reset Keras Session
 def reset_keras():
     K.clear_session()
+
+
+# --- Sparse helpers ---
+
+def _scipy_to_tf_sparse(sp_matrix):
+    """Convert scipy.sparse matrix to tf.SparseTensor."""
+    coo = scipy.sparse.coo_matrix(sp_matrix)
+    order = np.lexsort((coo.col, coo.row))
+    indices = np.column_stack((coo.row[order], coo.col[order])).astype(np.int64)
+    values = coo.data[order].astype(np.float32)
+    return tf.SparseTensor(indices=indices, values=values, dense_shape=coo.shape)
+
+
+def _scipy_to_sparse_value(sp_matrix):
+    """Convert scipy.sparse matrix to tf.compat.v1.SparseTensorValue for K.function feeds."""
+    coo = scipy.sparse.coo_matrix(sp_matrix)
+    order = np.lexsort((coo.col, coo.row))
+    indices = np.column_stack((coo.row[order], coo.col[order])).astype(np.int64)
+    values = coo.data[order].astype(np.float32)
+    dense_shape = np.array(coo.shape, dtype=np.int64)
+    return tf.compat.v1.SparseTensorValue(indices, values, dense_shape)
+
+
+def _matrix_rank(mat):
+    """Compute matrix rank for dense or sparse matrices."""
+    if scipy.sparse.issparse(mat):
+        k = min(mat.shape)
+        if k <= 10000:
+            ata = (mat.T @ mat).toarray()
+            return np.linalg.matrix_rank(ata)
+        else:
+            return k
+    return np.linalg.matrix_rank(mat)
+
+
+def _sparse_std(mat, axis=0):
+    """Compute std along axis for dense or sparse matrices."""
+    if scipy.sparse.issparse(mat):
+        mean_sq = np.asarray(mat.power(2).mean(axis=axis)).flatten()
+        mean_ = np.asarray(mat.mean(axis=axis)).flatten()
+        return np.sqrt(np.maximum(mean_sq - mean_ ** 2, 0))
+    return np.std(mat, axis=axis)
+
+
+def _sparse_col_mean(mat, col_idx):
+    """Compute mean of a single column for dense or sparse matrices."""
+    if scipy.sparse.issparse(mat):
+        return mat[:, col_idx].toarray().mean()
+    return np.mean(mat[:, col_idx])
+
+
+def _sparse_dot(mat, vec):
+    """Matrix-vector or matrix-matrix multiply, sparse-compatible."""
+    if scipy.sparse.issparse(mat):
+        return np.asarray(mat.dot(vec))
+    return np.dot(mat, vec)
+
+
+class SparseDense(tf_keras.layers.Layer):
+    """Dense layer that supports tf.SparseTensor inputs via sparse_dense_matmul."""
+    def __init__(self, units, use_bias=False, name=None, weights=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.units = units
+        self._init_weights = weights
+
+    def build(self, input_shape):
+        init = (tf_keras.initializers.Constant(self._init_weights[0])
+                if self._init_weights else 'glorot_uniform')
+        self.kernel = self.add_weight(
+            name='kernel',
+            shape=(input_shape[-1], self.units),
+            initializer=init,
+            trainable=True,
+        )
+        super().build(input_shape)
+
+    def call(self, inputs):
+        if isinstance(inputs, tf.SparseTensor):
+            return tf.sparse.sparse_dense_matmul(inputs, self.kernel)
+        return tf.matmul(inputs, self.kernel)
 
 
 class ZINBLogLik:
@@ -131,19 +212,24 @@ class TensorZINB:
         **kwargs,
     ):
         self.endog = endog
-        if len(endog.shape) == 1:
-            self.num_sample = len(endog)
+        if scipy.sparse.issparse(endog):
+            self.endog = endog.toarray()
+        if len(self.endog.shape) == 1:
+            self.num_sample = len(self.endog)
             self.num_out = 1
-            self.endog = endog.reshape((-1, 1))
+            self.endog = self.endog.reshape((-1, 1))
         else:
-            self.num_sample, self.num_out = np.shape(endog)
+            self.num_sample, self.num_out = np.shape(self.endog)
 
         df_model = 0
         df_model_c = 0
 
         self.exog = exog
-        df_model = np.linalg.matrix_rank(exog)
-        if len(exog.shape) == 1:
+        self._exog_is_sparse = scipy.sparse.issparse(exog)
+        df_model = _matrix_rank(exog)
+        if self._exog_is_sparse:
+            self.k_exog = exog.shape[1]
+        elif len(exog.shape) == 1:
             self.k_exog = 1
             self.exog = exog.reshape((-1, 1))
         else:
@@ -153,12 +239,14 @@ class TensorZINB:
         if exog_c is None:
             self.k_exog_c = 0
             self._no_exog_c = True
+            self._exog_c_is_sparse = False
             self.exog_c = np.zeros((self.num_sample, self.k_exog_c), dtype=np.float64)
         else:
+            self._exog_c_is_sparse = scipy.sparse.issparse(exog_c)
             self.k_exog_c = exog_c.shape[1]
             self._no_exog_c = False
             if self.k_exog_c > 0:
-                df_model_c = df_model_c + np.linalg.matrix_rank(exog_c)
+                df_model_c = df_model_c + _matrix_rank(exog_c)
 
         self.nb_only = nb_only
         if exog_infl is None and exog_infl_c is None:
@@ -168,27 +256,31 @@ class TensorZINB:
         if exog_infl is None or self.nb_only:
             self.k_exog_infl = 0
             self._no_exog_infl = True
+            self._exog_infl_is_sparse = False
             self.exog_infl = np.ones(
                 (self.num_sample, self.k_exog_infl), dtype=np.float64
             )
         else:
+            self._exog_infl_is_sparse = scipy.sparse.issparse(exog_infl)
             self.k_exog_infl = exog_infl.shape[1]
             self._no_exog_infl = False
             if self.k_exog_infl > 0:
-                df_model = df_model + np.linalg.matrix_rank(exog_infl)
+                df_model = df_model + _matrix_rank(exog_infl)
 
         self.exog_infl_c = exog_infl_c
         if exog_infl_c is None or self.nb_only:
             self.k_exog_infl_c = 0
             self._no_exog_infl_c = True
+            self._exog_infl_c_is_sparse = False
             self.exog_infl_c = np.ones(
                 (self.num_sample, self.k_exog_infl_c), dtype=np.float64
             )
         else:
+            self._exog_infl_c_is_sparse = scipy.sparse.issparse(exog_infl_c)
             self.k_exog_infl_c = exog_infl_c.shape[1]
             self._no_exog_infl_c = False
             if self.k_exog_infl_c > 0:
-                df_model_c = df_model_c + np.linalg.matrix_rank(exog_infl_c)
+                df_model_c = df_model_c + _matrix_rank(exog_infl_c)
 
         df_model_each = df_model + df_model_c
         df_model = df_model * self.num_out + df_model_c
@@ -254,24 +346,33 @@ class TensorZINB:
                 reset_keras()
                 K.clear_session()
 
+        any_sparse = (self._exog_is_sparse or self._exog_c_is_sparse or
+                      self._exog_infl_is_sparse or self._exog_infl_c_is_sparse)
+
         with tf.device(device_name):
             tf.compat.v1.disable_eager_execution()
 
-            inputs = Input(shape=(num_feat,))
-            inputs_infl = Input(shape=(num_feat_infl,))
-            inputs_c = Input(shape=(num_feat_c,))
-            inputs_infl_c = Input(shape=(num_feat_infl_c,))
+            inputs = Input(shape=(num_feat,), sparse=self._exog_is_sparse)
+            inputs_infl = Input(shape=(num_feat_infl,), sparse=self._exog_infl_is_sparse)
+            inputs_c = Input(shape=(num_feat_c,), sparse=self._exog_c_is_sparse)
+            inputs_infl_c = Input(shape=(num_feat_infl_c,), sparse=self._exog_infl_c_is_sparse)
             inputs_theta = Input(shape=(1,))
 
+            # select Dense or SparseDense based on input sparsity
+            DenseCls_exog = SparseDense if self._exog_is_sparse else Dense
+            DenseCls_exog_c = SparseDense if self._exog_c_is_sparse else Dense
+            DenseCls_exog_infl = SparseDense if self._exog_infl_is_sparse else Dense
+            DenseCls_exog_infl_c = SparseDense if self._exog_infl_c_is_sparse else Dense
+
             if 'x_mu' in init_weights:
-                x = Dense(num_out, use_bias=False, name='x_mu', weights=[init_weights['x_mu']])(inputs)
+                x = DenseCls_exog(num_out, use_bias=False, name='x_mu', weights=[init_weights['x_mu']])(inputs)
             else:
-                x = Dense(num_out, use_bias=False, name='x_mu')(inputs)
+                x = DenseCls_exog(num_out, use_bias=False, name='x_mu')(inputs)
             if num_feat_c>0:
                 if 'z_mu' in init_weights:
-                    x_c = Dense(1, use_bias=False, name='z_mu', weights=[init_weights['z_mu']])(inputs_c)
+                    x_c = DenseCls_exog_c(1, use_bias=False, name='z_mu', weights=[init_weights['z_mu']])(inputs_c)
                 else:
-                    x_c = Dense(1, use_bias=False, name='z_mu')(inputs_c)
+                    x_c = DenseCls_exog_c(1, use_bias=False, name='z_mu')(inputs_c)
                 predictions = Add()([x,x_c])
             else:
                 predictions = x
@@ -280,15 +381,15 @@ class TensorZINB:
                 pi = None
             else:
                 if 'x_pi' in init_weights:
-                    x_infl = Dense(num_out, use_bias=False, name='x_pi', weights=[init_weights['x_pi']])(inputs_infl)
+                    x_infl = DenseCls_exog_infl(num_out, use_bias=False, name='x_pi', weights=[init_weights['x_pi']])(inputs_infl)
                 else:
-                    x_infl = Dense(num_out, use_bias=False, name='x_pi')(inputs_infl)
+                    x_infl = DenseCls_exog_infl(num_out, use_bias=False, name='x_pi')(inputs_infl)
 
                 if num_feat_infl_c>0:
                     if 'z_pi' in init_weights:
-                        x_infl_c = Dense(1, use_bias=False, name='z_pi', weights=[init_weights['z_pi']])(inputs_infl_c)
+                        x_infl_c = DenseCls_exog_infl_c(1, use_bias=False, name='z_pi', weights=[init_weights['z_pi']])(inputs_infl_c)
                     else:
-                        x_infl_c = Dense(1, use_bias=False, name='z_pi')(inputs_infl_c)
+                        x_infl_c = DenseCls_exog_infl_c(1, use_bias=False, name='z_pi')(inputs_infl_c)
                     pi = Add()([x_infl, x_infl_c])
                 else:
                     pi = x_infl
@@ -342,26 +443,53 @@ class TensorZINB:
                 get_weights = PredictionCallback()
                 callbacks.append(get_weights)
 
-            # TODO: FIX this. code randomly crashes on apple silicon M1/M2 with 
+            # prepare sparse inputs as tf tensors (once, reused for training and LL)
+            if any_sparse:
+                def _to_tf(mat, is_sparse):
+                    if is_sparse:
+                        return _scipy_to_tf_sparse(mat)
+                    return tf.constant(mat, dtype=tf.float32)
+
+                tf_exog = _to_tf(self.exog, self._exog_is_sparse)
+                tf_exog_c = _to_tf(self.exog_c, self._exog_c_is_sparse)
+                tf_exog_infl = _to_tf(self.exog_infl, self._exog_infl_is_sparse)
+                tf_exog_infl_c = _to_tf(self.exog_infl_c, self._exog_infl_c_is_sparse)
+                tf_theta_ones = tf.constant(np.ones((num_sample, 1), dtype=np.float32))
+                tf_endog = tf.constant(self.endog.astype(np.float32))
+
+                dataset = tf.data.Dataset.from_tensors((
+                    (tf_exog, tf_exog_c, tf_exog_infl, tf_exog_infl_c, tf_theta_ones),
+                    tf_endog,
+                ))
+
+            # TODO: FIX this. code randomly crashes on apple silicon M1/M2 with
             # error `Incompatible shapes`. code usually runs fine after second try.
             # similar to this issue https://developer.apple.com/forums/thread/701985
             for i in range(10):
                 try:
                     start_time = time.time()
-                    losses = model.fit(
-                        [
-                            self.exog,
-                            self.exog_c,
-                            self.exog_infl,
-                            self.exog_infl_c,
-                            np.ones((num_sample, 1)),
-                        ],
-                        [self.endog],
-                        callbacks=callbacks,
-                        batch_size=num_sample,
-                        epochs=epochs,
-                        verbose=0,
-                    )
+                    if any_sparse:
+                        losses = model.fit(
+                            dataset,
+                            callbacks=callbacks,
+                            epochs=epochs,
+                            verbose=0,
+                        )
+                    else:
+                        losses = model.fit(
+                            [
+                                self.exog,
+                                self.exog_c,
+                                self.exog_infl,
+                                self.exog_infl_c,
+                                np.ones((num_sample, 1)),
+                            ],
+                            [self.endog],
+                            callbacks=callbacks,
+                            batch_size=num_sample,
+                            epochs=epochs,
+                            verbose=0,
+                        )
                     cpu_time = time.time() - start_time
                     break
                 except Exception as e:
@@ -374,16 +502,34 @@ class TensorZINB:
                 [inputs, inputs_c, inputs_infl, inputs_infl_c, inputs_theta, zinb.y],
                 [zinb.llf],
             )
-            llft = get_llfs(
-                [
-                    self.exog,
-                    self.exog_c,
-                    self.exog_infl,
-                    self.exog_infl_c,
-                    np.ones((num_sample, 1)),
-                    self.endog,
-                ]
-            )[0]
+
+            if any_sparse:
+                def _to_feed(mat, is_sparse):
+                    if is_sparse:
+                        return _scipy_to_sparse_value(mat)
+                    return mat
+
+                llft = get_llfs(
+                    [
+                        _to_feed(self.exog, self._exog_is_sparse),
+                        _to_feed(self.exog_c, self._exog_c_is_sparse),
+                        _to_feed(self.exog_infl, self._exog_infl_is_sparse),
+                        _to_feed(self.exog_infl_c, self._exog_infl_c_is_sparse),
+                        np.ones((num_sample, 1)),
+                        self.endog,
+                    ]
+                )[0]
+            else:
+                llft = get_llfs(
+                    [
+                        self.exog,
+                        self.exog_c,
+                        self.exog_infl,
+                        self.exog_infl_c,
+                        np.ones((num_sample, 1)),
+                        self.endog,
+                    ]
+                )[0]
 
             llfs = -(llft * num_sample + np.sum(gammaln(self.endog + 1), axis=0))
             aics = -2 * (llfs - self.df_model_each)
@@ -455,32 +601,36 @@ class TensorZINB:
         infl_prob_max=0.99,
     ):
         find_poi_sol = True
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore")
-            try:
-                poi_mod = sm.Poisson(Y, self.exog).fit(
-                    maxiter=maxiter, disp=False, warn_convergence=False
-                )
-                if np.isnan(poi_mod.params).any():
-                    find_poi_sol = False
-                else:
-                    mu = poi_mod.predict()
-                    a = self._estimate_dispersion(
-                        mu, poi_mod.resid, df_resid=poi_mod.df_resid
+        if self._exog_is_sparse:
+            # statsmodels cannot handle sparse; skip to fallback
+            find_poi_sol = False
+        else:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore")
+                try:
+                    poi_mod = sm.Poisson(Y, self.exog).fit(
+                        maxiter=maxiter, disp=False, warn_convergence=False
                     )
-                    theta = 1 / max(a, theta_lb)
-                    x_mu = np.reshape(poi_mod.params, (self.k_exog, 1))
-            except:
-                find_poi_sol = False
+                    if np.isnan(poi_mod.params).any():
+                        find_poi_sol = False
+                    else:
+                        mu = poi_mod.predict()
+                        a = self._estimate_dispersion(
+                            mu, poi_mod.resid, df_resid=poi_mod.df_resid
+                        )
+                        theta = 1 / max(a, theta_lb)
+                        x_mu = np.reshape(poi_mod.params, (self.k_exog, 1))
+                except:
+                    find_poi_sol = False
 
         if not find_poi_sol:
-            vs = np.std(self.exog, axis=0)
+            vs = _sparse_std(self.exog, axis=0)
             # find intercept index
             min_idx = np.argmin(vs)
             if vs[min_idx] < intercept_var_th:
                 x_mu = np.zeros((self.k_exog, 1))
                 mu = np.mean(Y)
-                x_mu[min_idx] = np.log(mu) / np.mean(self.exog[:, min_idx])
+                x_mu[min_idx] = np.log(mu) / _sparse_col_mean(self.exog, min_idx)
                 resid = Y - mu
                 a = self._estimate_dispersion(mu, resid)
                 if np.isnan(a) or np.isinf(a):
@@ -497,12 +647,12 @@ class TensorZINB:
             p_nonzero = 1 - np.mean(np.power(theta / (theta + pred + eps), theta))
 
             # find intercept index
-            vs = np.std(self.exog_infl, axis=0)
+            vs = _sparse_std(self.exog_infl, axis=0)
             min_idx = np.argmin(vs)
             if vs[min_idx] < intercept_var_th:
                 nz_prob = np.mean(Y > 0)
                 x_pi = np.zeros((self.k_exog_infl, 1))
-                fv = np.mean(self.exog_infl[:, min_idx])
+                fv = _sparse_col_mean(self.exog_infl, min_idx)
                 w_pi = self._compute_pi_init(
                     nz_prob, p_nonzero, infl_prob_max=infl_prob_max
                 )
@@ -576,12 +726,12 @@ class TensorZINB:
         if self._no_exog_infl:
             return weights
         # find intercept index
-        vs = np.std(self.exog_infl, axis=0)
+        vs = _sparse_std(self.exog_infl, axis=0)
         min_idx = np.argmin(vs)
         # do not compute logit weight if there is no intercept
         if vs[min_idx] < intercept_var_th:
             x_pi = np.zeros((self.k_exog_infl, self.num_out))
-            fv = np.mean(self.exog_infl[:, min_idx])
+            fv = _sparse_col_mean(self.exog_infl, min_idx)
             if self.same_dispersion:
                 theta = np.exp(
                     np.array(list(weights["theta"].flatten()) * self.num_out)
@@ -591,10 +741,10 @@ class TensorZINB:
 
             mu_c = 0
             if self.k_exog_c > 0 and "z_mu" in weights:
-                mu_c = np.dot(self.exog_c, weights["z_mu"])
+                mu_c = _sparse_dot(self.exog_c, weights["z_mu"])
 
             for i in range(self.num_out):
-                mu = np.dot(self.exog, weights["x_mu"][:, i]) + mu_c
+                mu = _sparse_dot(self.exog, weights["x_mu"][:, i]) + mu_c
                 mu = np.exp(mu)
                 p_nonzero = 1 - np.mean(np.power(theta[i] / (theta[i] + mu), theta[i]))
                 nz_prob = np.mean(self.endog[:, i] > 0)
