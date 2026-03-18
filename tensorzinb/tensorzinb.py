@@ -1,7 +1,6 @@
 import warnings
 import time
 
-import contextlib
 import os
 import numpy as np
 import scipy.sparse
@@ -39,14 +38,18 @@ def _scipy_to_tf_sparse(sp_matrix):
     return tf.SparseTensor(indices=indices, values=values, dense_shape=coo.shape)
 
 
-def _scipy_to_sparse_value(sp_matrix):
-    """Convert scipy.sparse matrix to tf.compat.v1.SparseTensorValue for K.function feeds."""
-    coo = scipy.sparse.coo_matrix(sp_matrix)
-    order = np.lexsort((coo.col, coo.row))
-    indices = np.column_stack((coo.row[order], coo.col[order])).astype(np.int64)
-    values = coo.data[order].astype(np.float32)
-    dense_shape = np.array(coo.shape, dtype=np.int64)
-    return tf.compat.v1.SparseTensorValue(indices, values, dense_shape)
+def _to_tf_input(mat, is_sparse):
+    """Convert dense or scipy sparse matrices to TF runtime inputs."""
+    if is_sparse:
+        return _scipy_to_tf_sparse(mat)
+    return tf.convert_to_tensor(mat, dtype=tf.float32)
+
+
+def _input_signature(shape, is_sparse):
+    """Build a tf.data signature matching a model input."""
+    if is_sparse:
+        return tf.SparseTensorSpec(shape=shape, dtype=tf.float32)
+    return tf.TensorSpec(shape=shape, dtype=tf.float32)
 
 
 def _matrix_rank(mat):
@@ -122,36 +125,49 @@ class ZINBLogLik:
 
     def loss(self, y_true, y_pred):
         with tf.name_scope(self.scope):
-            y = tf.cast(y_true, tf.float32)
-            # mu is already in log
-            mu = tf.cast(y_pred, tf.float32)
-            log_theta = self.log_theta
-            theta = tf.math.exp(log_theta)
-
-            t1 = tf.math.lgamma(y + theta)
-            t2 = -tf.math.lgamma(theta)
-            t3 = theta * log_theta
-            t4 = y * mu
-            ty = tf.reduce_logsumexp(tf.stack([log_theta, mu], axis=0), axis=0)
-            t5 = -(theta + y) * ty
-
-            if self.nb_only:
-                result = -(t1 + t2 + t3 + t4 + t5)
-            else:
-                log_q0 = -tf.nn.softplus(-self.pi)
-                # log_q1 = -tf.nn.softplus(self.pi) = -tf.nn.softplus(-self.pi) - self.pi
-                log_q1 = log_q0 - self.pi
-
-                nb_case = -(t1 + t2 + t3 + t4 + t5 + log_q1)
-
-                p1 = theta * (log_theta - ty) + log_q1
-                zero_case = -tf.reduce_logsumexp(tf.stack([log_q0, p1], axis=0), axis=0)
-                result = tf.where(tf.less(y, self.zero_threshold), zero_case, nb_case)
-            self.llf = tf.reduce_mean(result, axis=0)
-            self.y = y
-            result = tf.reduce_sum(self.llf)
-
+            result, llf = self._loss_components(
+                y_true,
+                y_pred,
+                self.pi,
+                self.log_theta,
+                self.nb_only,
+                self.zero_threshold,
+            )
+            self.llf = llf
+            self.y = tf.cast(y_true, tf.float32)
         return result
+
+    @staticmethod
+    def _loss_components(y_true, y_pred, pi, log_theta, nb_only, zero_threshold):
+        y = tf.cast(y_true, tf.float32)
+        # mu is already in log
+        mu = tf.cast(y_pred, tf.float32)
+        log_theta = tf.cast(log_theta, tf.float32)
+        theta = tf.math.exp(log_theta)
+
+        t1 = tf.math.lgamma(y + theta)
+        t2 = -tf.math.lgamma(theta)
+        t3 = theta * log_theta
+        t4 = y * mu
+        ty = tf.reduce_logsumexp(tf.stack([log_theta, mu], axis=0), axis=0)
+        t5 = -(theta + y) * ty
+
+        if nb_only:
+            result = -(t1 + t2 + t3 + t4 + t5)
+        else:
+            pi = tf.cast(pi, tf.float32)
+            log_q0 = -tf.nn.softplus(-pi)
+            # log_q1 = -tf.nn.softplus(self.pi) = -tf.nn.softplus(-self.pi) - self.pi
+            log_q1 = log_q0 - pi
+
+            nb_case = -(t1 + t2 + t3 + t4 + t5 + log_q1)
+
+            p1 = theta * (log_theta - ty) + log_q1
+            zero_case = -tf.reduce_logsumexp(tf.stack([log_q0, p1], axis=0), axis=0)
+            result = tf.where(tf.less(y, zero_threshold), zero_case, nb_case)
+
+        llf = tf.reduce_mean(result, axis=0)
+        return tf.reduce_sum(llf), llf
 
 
 class PredictionCallback(tf_keras.callbacks.Callback):
@@ -163,6 +179,42 @@ class PredictionCallback(tf_keras.callbacks.Callback):
             np.concatenate([np.array(w.flatten()) for w in self.model.get_weights()])
         ).flatten()
         self.weights.append(ws)
+
+
+class TensorZINBTrainingModel(Model):
+    def __init__(self, inputs, outputs, nb_only=False, zero_threshold=1e-8):
+        super().__init__(inputs=inputs, outputs=outputs)
+        self.nb_only = nb_only
+        self.zero_threshold = zero_threshold
+
+    def train_step(self, data):
+        x, y = data
+        with tf.GradientTape() as tape:
+            outputs = self(x, training=True)
+            if self.nb_only:
+                pred_mu, pred_theta = outputs
+                loss, _ = ZINBLogLik._loss_components(
+                    y,
+                    pred_mu,
+                    None,
+                    pred_theta,
+                    True,
+                    self.zero_threshold,
+                )
+            else:
+                pred_mu, pred_pi, pred_theta = outputs
+                loss, _ = ZINBLogLik._loss_components(
+                    y,
+                    pred_mu,
+                    pred_pi,
+                    pred_theta,
+                    False,
+                    self.zero_threshold,
+                )
+
+        grads = tape.gradient(loss, self.trainable_weights)
+        self.optimizer.apply_gradients(zip(grads, self.trainable_weights))
+        return {"loss": loss}
 
 
 class ReduceLROnPlateauSkip(ReduceLROnPlateau):
@@ -298,6 +350,34 @@ class TensorZINB:
 
         self.loglike_method = "nb2"
 
+    def _make_runtime_inputs(self):
+        return [
+            _to_tf_input(self.exog, self._exog_is_sparse),
+            _to_tf_input(self.exog_c, self._exog_c_is_sparse),
+            _to_tf_input(self.exog_infl, self._exog_infl_is_sparse),
+            _to_tf_input(self.exog_infl_c, self._exog_infl_c_is_sparse),
+            tf.ones((self.num_sample, 1), dtype=tf.float32),
+        ]
+
+    def _make_training_dataset(self):
+        inputs = self._make_runtime_inputs()
+        output_signature = (
+            (
+                _input_signature((self.num_sample, self.k_exog), self._exog_is_sparse),
+                _input_signature((self.num_sample, self.k_exog_c), self._exog_c_is_sparse),
+                _input_signature((self.num_sample, self.k_exog_infl), self._exog_infl_is_sparse),
+                _input_signature((self.num_sample, self.k_exog_infl_c), self._exog_infl_c_is_sparse),
+                tf.TensorSpec(shape=(self.num_sample, 1), dtype=tf.float32),
+            ),
+            tf.TensorSpec(shape=self.endog.shape, dtype=tf.float32),
+        )
+
+        def gen():
+            while True:
+                yield tuple(inputs), self.endog.astype(np.float32)
+
+        return tf.data.Dataset.from_generator(gen, output_signature=output_signature)
+
     def fit(
         self,
         init_weights={},
@@ -350,8 +430,6 @@ class TensorZINB:
                       self._exog_infl_is_sparse or self._exog_infl_c_is_sparse)
 
         with tf.device(device_name):
-            tf.compat.v1.disable_eager_execution()
-
             inputs = Input(shape=(num_feat,), sparse=self._exog_is_sparse)
             inputs_infl = Input(shape=(num_feat_infl,), sparse=self._exog_infl_is_sparse)
             inputs_c = Input(shape=(num_feat_c,), sparse=self._exog_c_is_sparse)
@@ -403,20 +481,17 @@ class TensorZINB:
             else:
                 theta = theta0
 
-            zinb = ZINBLogLik(pi, theta, nb_only=self.nb_only)
-
-            if self.nb_only:
-                output = Lambda(lambda x: x[0])([predictions, theta])
-            else:
-                output = Lambda(lambda x: x[0])([predictions, pi, theta])
-
-            model = Model(
-                inputs=[inputs, inputs_c, inputs_infl, inputs_infl_c, inputs_theta],
-                outputs=[output],
+            model_inputs = [inputs, inputs_c, inputs_infl, inputs_infl_c, inputs_theta]
+            model_outputs = [predictions, theta] if self.nb_only else [predictions, pi, theta]
+            model = TensorZINBTrainingModel(
+                inputs=model_inputs,
+                outputs=model_outputs,
+                nb_only=self.nb_only,
+                zero_threshold=1e-8,
             )
 
             opt = RMSprop(learning_rate=learning_rate)
-            model.compile(loss=zinb.loss, optimizer=opt)
+            model.compile(optimizer=opt, run_eagerly=True)
 
             callbacks = []
             if is_early_stop:
@@ -443,28 +518,17 @@ class TensorZINB:
                 get_weights = PredictionCallback()
                 callbacks.append(get_weights)
 
-            # prepare sparse inputs as tf tensors (once, reused for training and LL)
-            if any_sparse:
-                def _to_tf(mat, is_sparse):
-                    if is_sparse:
-                        return _scipy_to_tf_sparse(mat)
-                    return tf.constant(mat, dtype=tf.float32)
-
-                tf_exog = _to_tf(self.exog, self._exog_is_sparse)
-                tf_exog_c = _to_tf(self.exog_c, self._exog_c_is_sparse)
-                tf_exog_infl = _to_tf(self.exog_infl, self._exog_infl_is_sparse)
-                tf_exog_infl_c = _to_tf(self.exog_infl_c, self._exog_infl_c_is_sparse)
-                tf_theta_ones = tf.constant(np.ones((num_sample, 1), dtype=np.float32))
-                tf_endog = tf.constant(self.endog.astype(np.float32))
-
-                dataset = tf.data.Dataset.from_tensors((
-                    (tf_exog, tf_exog_c, tf_exog_infl, tf_exog_infl_c, tf_theta_ones),
-                    tf_endog,
-                ))
+            runtime_inputs = self._make_runtime_inputs()
+            tf_endog = tf.convert_to_tensor(self.endog.astype(np.float32), dtype=tf.float32)
+            # TODO: Add optional minibatch training to reduce peak memory use on very large inputs.
+            dataset = self._make_training_dataset() if any_sparse else None
 
             # TODO: FIX this. code randomly crashes on apple silicon M1/M2 with
             # error `Incompatible shapes`. code usually runs fine after second try.
             # similar to this issue https://developer.apple.com/forums/thread/701985
+            losses = None
+            cpu_time = None
+            last_error = None
             for i in range(10):
                 try:
                     start_time = time.time()
@@ -472,6 +536,7 @@ class TensorZINB:
                         losses = model.fit(
                             dataset,
                             callbacks=callbacks,
+                            steps_per_epoch=1,
                             epochs=epochs,
                             verbose=0,
                         )
@@ -493,43 +558,36 @@ class TensorZINB:
                     cpu_time = time.time() - start_time
                     break
                 except Exception as e:
+                    last_error = e
                     print(model.summary())
                     print(e)
                     continue
 
-            # retrieve LL
-            get_llfs = K.function(
-                [inputs, inputs_c, inputs_infl, inputs_infl_c, inputs_theta, zinb.y],
-                [zinb.llf],
-            )
+            if losses is None:
+                raise RuntimeError("TensorZINB training failed after 10 attempts") from last_error
 
-            if any_sparse:
-                def _to_feed(mat, is_sparse):
-                    if is_sparse:
-                        return _scipy_to_sparse_value(mat)
-                    return mat
-
-                llft = get_llfs(
-                    [
-                        _to_feed(self.exog, self._exog_is_sparse),
-                        _to_feed(self.exog_c, self._exog_c_is_sparse),
-                        _to_feed(self.exog_infl, self._exog_infl_is_sparse),
-                        _to_feed(self.exog_infl_c, self._exog_infl_c_is_sparse),
-                        np.ones((num_sample, 1)),
-                        self.endog,
-                    ]
-                )[0]
+            eval_outputs = model(runtime_inputs, training=False)
+            if self.nb_only:
+                pred_mu, pred_theta = eval_outputs
+                _, llft = ZINBLogLik._loss_components(
+                    tf_endog,
+                    pred_mu,
+                    None,
+                    pred_theta,
+                    True,
+                    model.zero_threshold,
+                )
             else:
-                llft = get_llfs(
-                    [
-                        self.exog,
-                        self.exog_c,
-                        self.exog_infl,
-                        self.exog_infl_c,
-                        np.ones((num_sample, 1)),
-                        self.endog,
-                    ]
-                )[0]
+                pred_mu, pred_pi, pred_theta = eval_outputs
+                _, llft = ZINBLogLik._loss_components(
+                    tf_endog,
+                    pred_mu,
+                    pred_pi,
+                    pred_theta,
+                    False,
+                    model.zero_threshold,
+                )
+            llft = llft.numpy()
 
             llfs = -(llft * num_sample + np.sum(gammaln(self.endog + 1), axis=0))
             aics = -2 * (llfs - self.df_model_each)

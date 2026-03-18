@@ -167,6 +167,10 @@ To run tensorflow on Apple silicon (M1, M2, etc), install TensorFlow using the f
 
 If the solver cannot return correct results, please ensure features in $X$ are normalized by using `StandardScaler()`. Please refer to the example in [`examples/deg_example.ipynb`](examples/deg_example.ipynb).
 
+### Sparse input note
+
+The sparse-input path runs in TensorFlow eager mode to avoid legacy graph serialization limits with large `SparseTensor` inputs. Optional minibatch training for very large datasets is not implemented yet and remains future work.
+
 
 ## Reference
 Cui, T., Wang, T. [A Comprehensive Assessment of Hurdle and Zero-inflated Models for Single Cell RNA-sequencing Analysis](https://doi.org/10.1093/bib/bbad272), Briefings in Bioinformatics, July 2023. https://doi.org/10.1093/bib/bbad272
