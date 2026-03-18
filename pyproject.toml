@@ -7,7 +7,7 @@ build-backend = "hatchling.build"
 [project]
 # Distribution name on PyPI — what users type in `pip install tensorzinb-plusplus`
 name = "tensorzinb-plusplus"
-version = "0.0.4"
+version = "0.0.5"
 description = "Zero Inflated Negative Binomial regression for scRNA-seq (maintained fork of tensorzinb by Tao Cui & Tingting Wang)"
 readme = "README.md"
 license = { text = "Apache-2.0" }
