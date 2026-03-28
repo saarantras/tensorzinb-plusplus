@@ -415,7 +415,7 @@ class TensorZINB:
             if init_method == "poi":
                 init_weights = self._poisson_init()
             elif init_method == "nb":
-                init_weights = self._nb_init()
+                init_weights = self._nb_init(device_name=device_name)
 
         # use distinct names to retrieve weights from layers
         weight_keys = ["x_mu", "z_mu", "x_pi", "z_pi", "theta"]
@@ -770,7 +770,7 @@ class TensorZINB:
                 weights["theta"] = t
         return weights
 
-    def _nb_init(self, infl_prob_max=0.99, intercept_var_th=1e-3):
+    def _nb_init(self, infl_prob_max=0.99, intercept_var_th=1e-3, device_name=None):
         nb_mod = TensorZINB(
             self.endog,
             self.exog,
@@ -778,7 +778,7 @@ class TensorZINB:
             same_dispersion=self.same_dispersion,
             nb_only=True,
         )
-        nb_res = nb_mod.fit(init_method="poi")
+        nb_res = nb_mod.fit(init_method="poi", device_name=device_name)
         weights = nb_res["weights"]
 
         if self._no_exog_infl:
