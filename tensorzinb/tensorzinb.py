@@ -138,9 +138,9 @@ class ZINBLogLik:
         return result
 
     @staticmethod
-    def _loss_components(y_true, y_pred, pi, log_theta, nb_only, zero_threshold):
+    def _elementwise_nll(y_true, y_pred, pi, log_theta, nb_only, zero_threshold):
+        """Per-observation negative log-likelihood (shape [n, d]), no reduction."""
         y = tf.cast(y_true, tf.float32)
-        # mu is already in log
         mu = tf.cast(y_pred, tf.float32)
         log_theta = tf.cast(log_theta, tf.float32)
         theta = tf.math.exp(log_theta)
@@ -153,20 +153,28 @@ class ZINBLogLik:
         t5 = -(theta + y) * ty
 
         if nb_only:
-            result = -(t1 + t2 + t3 + t4 + t5)
+            return -(t1 + t2 + t3 + t4 + t5)
+
+        pi = tf.cast(pi, tf.float32)
+        log_q0 = -tf.nn.softplus(-pi)
+        log_q1 = log_q0 - pi
+
+        nb_case = -(t1 + t2 + t3 + t4 + t5 + log_q1)
+
+        p1 = theta * (log_theta - ty) + log_q1
+        zero_case = -tf.reduce_logsumexp(tf.stack([log_q0, p1], axis=0), axis=0)
+        return tf.where(tf.less(y, zero_threshold), zero_case, nb_case)
+
+    @staticmethod
+    def _loss_components(y_true, y_pred, pi, log_theta, nb_only, zero_threshold,
+                         sample_weight=None):
+        result = ZINBLogLik._elementwise_nll(
+            y_true, y_pred, pi, log_theta, nb_only, zero_threshold)
+        if sample_weight is not None:
+            w = tf.cast(tf.reshape(sample_weight, [-1, 1]), tf.float32)
+            llf = tf.reduce_sum(result * w, axis=0) / tf.reduce_sum(w)
         else:
-            pi = tf.cast(pi, tf.float32)
-            log_q0 = -tf.nn.softplus(-pi)
-            # log_q1 = -tf.nn.softplus(self.pi) = -tf.nn.softplus(-self.pi) - self.pi
-            log_q1 = log_q0 - pi
-
-            nb_case = -(t1 + t2 + t3 + t4 + t5 + log_q1)
-
-            p1 = theta * (log_theta - ty) + log_q1
-            zero_case = -tf.reduce_logsumexp(tf.stack([log_q0, p1], axis=0), axis=0)
-            result = tf.where(tf.less(y, zero_threshold), zero_case, nb_case)
-
-        llf = tf.reduce_mean(result, axis=0)
+            llf = tf.reduce_mean(result, axis=0)
         return tf.reduce_sum(llf), llf
 
 
@@ -182,10 +190,15 @@ class PredictionCallback(tf_keras.callbacks.Callback):
 
 
 class TensorZINBTrainingModel(Model):
-    def __init__(self, inputs, outputs, nb_only=False, zero_threshold=1e-8):
+    def __init__(self, inputs, outputs, nb_only=False, zero_threshold=1e-8,
+                 sample_weight=None):
         super().__init__(inputs=inputs, outputs=outputs)
         self.nb_only = nb_only
         self.zero_threshold = zero_threshold
+        self._sample_weight = (
+            tf.constant(sample_weight, dtype=tf.float32)
+            if sample_weight is not None else None
+        )
 
     def train_step(self, data):
         x, y = data
@@ -194,22 +207,14 @@ class TensorZINBTrainingModel(Model):
             if self.nb_only:
                 pred_mu, pred_theta = outputs
                 loss, _ = ZINBLogLik._loss_components(
-                    y,
-                    pred_mu,
-                    None,
-                    pred_theta,
-                    True,
-                    self.zero_threshold,
+                    y, pred_mu, None, pred_theta, True,
+                    self.zero_threshold, self._sample_weight,
                 )
             else:
                 pred_mu, pred_pi, pred_theta = outputs
                 loss, _ = ZINBLogLik._loss_components(
-                    y,
-                    pred_mu,
-                    pred_pi,
-                    pred_theta,
-                    False,
-                    self.zero_threshold,
+                    y, pred_mu, pred_pi, pred_theta, False,
+                    self.zero_threshold, self._sample_weight,
                 )
 
         grads = tape.gradient(loss, self.trainable_weights)
@@ -261,6 +266,7 @@ class TensorZINB:
         exog_infl_c=None,
         same_dispersion=False,
         nb_only=False,
+        sample_weight=None,
         **kwargs,
     ):
         self.endog = endog
@@ -272,6 +278,17 @@ class TensorZINB:
             self.endog = self.endog.reshape((-1, 1))
         else:
             self.num_sample, self.num_out = np.shape(self.endog)
+
+        if sample_weight is not None:
+            self.sample_weight = np.asarray(sample_weight, dtype=np.float64).ravel()
+            if self.sample_weight.shape[0] != self.num_sample:
+                raise ValueError(
+                    f"sample_weight length ({self.sample_weight.shape[0]}) "
+                    f"must match num_sample ({self.num_sample}).")
+            self.effective_n = float(np.sum(self.sample_weight))
+        else:
+            self.sample_weight = None
+            self.effective_n = float(self.num_sample)
 
         df_model = 0
         df_model_c = 0
@@ -413,6 +430,13 @@ class TensorZINB:
         # initiate weights
         if len(init_weights) == 0:
             if init_method == "poi":
+                if self.sample_weight is not None:
+                    warnings.warn(
+                        "init_method='poi' with sample_weight uses a scalar-mu "
+                        "fallback (statsmodels Poisson does not support weights). "
+                        "Use init_method='nb' for weighted fits.",
+                        stacklevel=2,
+                    )
                 init_weights = self._poisson_init()
             elif init_method == "nb":
                 init_weights = self._nb_init(device_name=device_name)
@@ -488,6 +512,7 @@ class TensorZINB:
                 outputs=model_outputs,
                 nb_only=self.nb_only,
                 zero_threshold=1e-8,
+                sample_weight=self.sample_weight,
             )
 
             opt = RMSprop(learning_rate=learning_rate)
@@ -497,7 +522,7 @@ class TensorZINB:
             if is_early_stop:
                 early_stop = EarlyStopping(
                     monitor="loss",
-                    min_delta=min_delta_early_stop / num_sample,
+                    min_delta=min_delta_early_stop / self.effective_n,
                     patience=patience_early_stop,
                     mode="min",
                 )
@@ -566,30 +591,30 @@ class TensorZINB:
             if losses is None:
                 raise RuntimeError("TensorZINB training failed after 10 attempts") from last_error
 
+            tf_sw = (tf.constant(self.sample_weight, dtype=tf.float32)
+                     if self.sample_weight is not None else None)
+
             eval_outputs = model(runtime_inputs, training=False)
             if self.nb_only:
                 pred_mu, pred_theta = eval_outputs
                 _, llft = ZINBLogLik._loss_components(
-                    tf_endog,
-                    pred_mu,
-                    None,
-                    pred_theta,
-                    True,
-                    model.zero_threshold,
+                    tf_endog, pred_mu, None, pred_theta, True,
+                    model.zero_threshold, tf_sw,
                 )
             else:
                 pred_mu, pred_pi, pred_theta = eval_outputs
                 _, llft = ZINBLogLik._loss_components(
-                    tf_endog,
-                    pred_mu,
-                    pred_pi,
-                    pred_theta,
-                    False,
-                    model.zero_threshold,
+                    tf_endog, pred_mu, pred_pi, pred_theta, False,
+                    model.zero_threshold, tf_sw,
                 )
             llft = llft.numpy()
 
-            llfs = -(llft * num_sample + np.sum(gammaln(self.endog + 1), axis=0))
+            if self.sample_weight is not None:
+                w = self.sample_weight.reshape(-1, 1)
+                llfs = -(llft * self.effective_n
+                         + np.sum(w * gammaln(self.endog + 1), axis=0))
+            else:
+                llfs = -(llft * num_sample + np.sum(gammaln(self.endog + 1), axis=0))
             aics = -2 * (llfs - self.df_model_each)
 
             llf = np.sum(llfs)
@@ -624,7 +649,7 @@ class TensorZINB:
                 "df": self.df_model_each,
                 "weights": weights_dict,
                 "cpu_time": cpu_time,
-                "num_sample": num_sample,
+                "num_sample": self.effective_n,
                 "epochs": len(losses.history["loss"]),
             }
 
@@ -635,13 +660,22 @@ class TensorZINB:
         return res
 
     # https://github.com/statsmodels/statsmodels/blob/main/statsmodels/discrete/discrete_model.py#L3691
-    def _estimate_dispersion(self, mu, resid, df_resid=None, loglike_method="nb2"):
-        if df_resid is None:
-            df_resid = resid.shape[0]
-        if loglike_method == "nb2":
-            a = ((resid**2 / mu - 1) / mu).sum() / df_resid
-        else:  # self.loglike_method == 'nb1':
-            a = (resid**2 / mu - 1).sum() / df_resid
+    def _estimate_dispersion(self, mu, resid, df_resid=None, loglike_method="nb2",
+                              sample_weight=None):
+        if sample_weight is not None:
+            w = sample_weight.ravel()
+            sum_w = np.sum(w)
+            if loglike_method == "nb2":
+                a = np.sum(w * (resid**2 / mu - 1) / mu) / sum_w
+            else:
+                a = np.sum(w * (resid**2 / mu - 1)) / sum_w
+        else:
+            if df_resid is None:
+                df_resid = resid.shape[0]
+            if loglike_method == "nb2":
+                a = ((resid**2 / mu - 1) / mu).sum() / df_resid
+            else:
+                a = (resid**2 / mu - 1).sum() / df_resid
         return a
 
     def _compute_pi_init(self, nz_prob, p_nonzero, infl_prob_max=0.99):
@@ -658,9 +692,13 @@ class TensorZINB:
         intercept_var_th=1e-3,
         infl_prob_max=0.99,
     ):
+        if self.sample_weight is not None:
+            _avg = lambda x: np.average(x, weights=self.sample_weight)
+        else:
+            _avg = np.mean
         find_poi_sol = True
-        if self._exog_is_sparse:
-            # statsmodels cannot handle sparse; skip to fallback
+        if self._exog_is_sparse or self.sample_weight is not None:
+            # statsmodels Poisson cannot handle sparse exog or sample weights
             find_poi_sol = False
         else:
             with warnings.catch_warnings():
@@ -687,10 +725,11 @@ class TensorZINB:
             min_idx = np.argmin(vs)
             if vs[min_idx] < intercept_var_th:
                 x_mu = np.zeros((self.k_exog, 1))
-                mu = np.mean(Y)
+                mu = _avg(Y)
                 x_mu[min_idx] = np.log(mu) / _sparse_col_mean(self.exog, min_idx)
                 resid = Y - mu
-                a = self._estimate_dispersion(mu, resid)
+                a = self._estimate_dispersion(mu, resid,
+                                              sample_weight=self.sample_weight)
                 if np.isnan(a) or np.isinf(a):
                     a = theta_lb
                 theta = 1 / max(a, theta_lb)
@@ -702,13 +741,15 @@ class TensorZINB:
 
         if not self._no_exog_infl and estimate_infl:
             pred = np.maximum(mu, 10 * eps)
-            p_nonzero = 1 - np.mean(np.power(theta / (theta + pred + eps), theta))
+            p_nb_zero = np.power(theta / (theta + pred + eps), theta)
+            p_nonzero = 1 - (_avg(p_nb_zero) if np.ndim(p_nb_zero) > 0
+                             else float(p_nb_zero))
 
             # find intercept index
             vs = _sparse_std(self.exog_infl, axis=0)
             min_idx = np.argmin(vs)
             if vs[min_idx] < intercept_var_th:
-                nz_prob = np.mean(Y > 0)
+                nz_prob = _avg(Y > 0)
                 x_pi = np.zeros((self.k_exog_infl, 1))
                 fv = _sparse_col_mean(self.exog_infl, min_idx)
                 w_pi = self._compute_pi_init(
@@ -777,8 +818,11 @@ class TensorZINB:
             exog_c=self.exog_c,
             same_dispersion=self.same_dispersion,
             nb_only=True,
+            sample_weight=self.sample_weight,
         )
-        nb_res = nb_mod.fit(init_method="poi", device_name=device_name)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="init_method='poi' with sample_weight")
+            nb_res = nb_mod.fit(init_method="poi", device_name=device_name)
         weights = nb_res["weights"]
 
         if self._no_exog_infl:
@@ -801,11 +845,16 @@ class TensorZINB:
             if self.k_exog_c > 0 and "z_mu" in weights:
                 mu_c = _sparse_dot(self.exog_c, weights["z_mu"])
 
+            if self.sample_weight is not None:
+                _avg = lambda x: np.average(x, weights=self.sample_weight)
+            else:
+                _avg = np.mean
+
             for i in range(self.num_out):
                 mu = _sparse_dot(self.exog, weights["x_mu"][:, i]) + mu_c
                 mu = np.exp(mu)
-                p_nonzero = 1 - np.mean(np.power(theta[i] / (theta[i] + mu), theta[i]))
-                nz_prob = np.mean(self.endog[:, i] > 0)
+                p_nonzero = 1 - _avg(np.power(theta[i] / (theta[i] + mu), theta[i]))
+                nz_prob = _avg(self.endog[:, i] > 0)
                 w_pi = self._compute_pi_init(
                     nz_prob, p_nonzero, infl_prob_max=infl_prob_max
                 )
