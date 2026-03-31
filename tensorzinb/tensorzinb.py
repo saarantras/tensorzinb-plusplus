@@ -430,6 +430,13 @@ class TensorZINB:
         # initiate weights
         if len(init_weights) == 0:
             if init_method == "poi":
+                if self.sample_weight is not None:
+                    warnings.warn(
+                        "init_method='poi' with sample_weight uses a scalar-mu "
+                        "fallback (statsmodels Poisson does not support weights). "
+                        "Use init_method='nb' for weighted fits.",
+                        stacklevel=2,
+                    )
                 init_weights = self._poisson_init()
             elif init_method == "nb":
                 init_weights = self._nb_init(device_name=device_name)
@@ -813,7 +820,9 @@ class TensorZINB:
             nb_only=True,
             sample_weight=self.sample_weight,
         )
-        nb_res = nb_mod.fit(init_method="poi", device_name=device_name)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="init_method='poi' with sample_weight")
+            nb_res = nb_mod.fit(init_method="poi", device_name=device_name)
         weights = nb_res["weights"]
 
         if self._no_exog_infl:
